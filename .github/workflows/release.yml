@@ -1,0 +1,194 @@
+name: Immutable v0.1.0 release
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: Successful post-main CI run ID
+        required: true
+        type: string
+      source_artifact_id:
+        description: Exact artifact ID from that CI run
+        required: true
+        type: string
+      source_commit_sha:
+        description: Exact main commit checked by that CI run
+        required: true
+        type: string
+      release_tag:
+        description: Immutable annotated release tag
+        required: true
+        default: v0.1.0
+        type: string
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPOSITORY: ${{ github.repository }}
+      SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+      SOURCE_ARTIFACT_ID: ${{ inputs.source_artifact_id }}
+      SOURCE_COMMIT_SHA: ${{ inputs.source_commit_sha }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
+    steps:
+      - name: Check out the exact main source
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.source_commit_sha }}
+          fetch-depth: 1
+
+      - name: Verify successful main run and exact artifact
+        id: source
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test "$RELEASE_TAG" = "v0.1.0"
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT_SHA"
+          main_sha=$(gh api "repos/$REPOSITORY/git/ref/heads/main" --jq '.object.sha')
+          test "$main_sha" = "$SOURCE_COMMIT_SHA"
+          run_json=$(gh api "repos/$REPOSITORY/actions/runs/$SOURCE_RUN_ID")
+          jq -e --arg sha "$SOURCE_COMMIT_SHA" --argjson run_id "$SOURCE_RUN_ID" '
+            .id == $run_id and .event == "push" and .head_branch == "main" and
+            .head_sha == $sha and .status == "completed" and .conclusion == "success"
+          ' <<< "$run_json" >/dev/null
+          artifact_json=$(gh api "repos/$REPOSITORY/actions/artifacts/$SOURCE_ARTIFACT_ID")
+          jq -e --arg sha "$SOURCE_COMMIT_SHA" --argjson run_id "$SOURCE_RUN_ID" --argjson artifact_id "$SOURCE_ARTIFACT_ID" '
+            .id == $artifact_id and .workflow_run.id == $run_id and .workflow_run.head_sha == $sha and
+            .expired == false and (.size_in_bytes|tonumber) > 0 and (.digest|startswith("sha256:"))
+          ' <<< "$artifact_json" >/dev/null
+          artifact_name=$(jq -r '.name' <<< "$artifact_json")
+          artifact_size=$(jq -r '.size_in_bytes' <<< "$artifact_json")
+          artifact_digest=$(jq -r '.digest' <<< "$artifact_json")
+          asset_name="${artifact_name}.zip"
+          asset_path="$RUNNER_TEMP/$asset_name"
+          gh api "repos/$REPOSITORY/actions/artifacts/$SOURCE_ARTIFACT_ID/zip" > "$asset_path"
+          test "$(wc -c < "$asset_path" | tr -d ' ')" = "$artifact_size"
+          test "sha256:$(sha256sum "$asset_path" | awk '{print $1}')" = "$artifact_digest"
+          echo "artifact_name=$artifact_name" >> "$GITHUB_OUTPUT"
+          echo "artifact_size=$artifact_size" >> "$GITHUB_OUTPUT"
+          echo "artifact_digest=$artifact_digest" >> "$GITHUB_OUTPUT"
+          echo "asset_name=$asset_name" >> "$GITHUB_OUTPUT"
+          echo "asset_path=$asset_path" >> "$GITHUB_OUTPUT"
+
+      - name: Verify immutable-release enforcement
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          immutable=$(gh api "repos/$REPOSITORY/immutable-releases")
+          jq -e '.enabled == true' <<< "$immutable" >/dev/null
+
+      - name: Refuse an existing tag or release
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if gh api "repos/$REPOSITORY/releases/tags/$RELEASE_TAG" > "$RUNNER_TEMP/existing-release.json" 2>/dev/null; then
+            echo "release already exists; immutable workflow refuses replacement" >&2
+            exit 1
+          fi
+          if gh api "repos/$REPOSITORY/git/ref/tags/$RELEASE_TAG" > "$RUNNER_TEMP/existing-tag.json" 2>/dev/null; then
+            echo "tag already exists; immutable workflow refuses replacement" >&2
+            exit 1
+          fi
+
+      - name: Create one annotated tag and verify its peeled target
+        id: tag
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          tag_json=$(gh api --method POST "repos/$REPOSITORY/git/tags" \
+            -f tag="$RELEASE_TAG" -f message="$RELEASE_TAG: claim evidence lifecycle" \
+            -f object="$SOURCE_COMMIT_SHA" -f type=commit)
+          tag_object=$(jq -r '.sha' <<< "$tag_json")
+          test -n "$tag_object" && test "$tag_object" != null
+          gh api --method POST "repos/$REPOSITORY/git/refs" \
+            -f ref="refs/tags/$RELEASE_TAG" -f sha="$tag_object" >/dev/null
+          ref_json=$(gh api "repos/$REPOSITORY/git/ref/tags/$RELEASE_TAG")
+          jq -e --arg tag_object "$tag_object" '.object.type == "tag" and .object.sha == $tag_object' <<< "$ref_json" >/dev/null
+          tag_object_json=$(gh api "repos/$REPOSITORY/git/tags/$tag_object")
+          jq -e --arg source "$SOURCE_COMMIT_SHA" '.object.type == "commit" and .object.sha == $source' <<< "$tag_object_json" >/dev/null
+          remote_refs=$(git ls-remote origin "refs/tags/$RELEASE_TAG" "refs/tags/$RELEASE_TAG^{}")
+          test "$(awk -v ref="refs/tags/$RELEASE_TAG" '$2==ref {print $1}' <<< "$remote_refs")" = "$tag_object"
+          test "$(awk -v ref="refs/tags/$RELEASE_TAG^{}" '$2==ref {print $1}' <<< "$remote_refs")" = "$SOURCE_COMMIT_SHA"
+          echo "tag_object=$tag_object" >> "$GITHUB_OUTPUT"
+
+      - name: Create the draft release before asset upload
+        id: draft
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          release_json=$(gh api --method POST "repos/$REPOSITORY/releases" \
+            -f tag_name="$RELEASE_TAG" -f target_commitish="$SOURCE_COMMIT_SHA" \
+            -f name="$RELEASE_TAG" -f body="Successful post-main CI evidence for the claim/evidence lifecycle contract." \
+            -F draft=true -F prerelease=false)
+          release_id=$(jq -r '.id' <<< "$release_json")
+          test -n "$release_id" && test "$release_id" != null
+          jq -e --arg tag "$RELEASE_TAG" '.tag_name == $tag and .draft == true and (.assets|length) == 0' <<< "$release_json" >/dev/null
+          echo "release_id=$release_id" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the exact CI artifact through the draft upload URL
+        id: upload
+        env:
+          ASSET_PATH: ${{ steps.source.outputs.asset_path }}
+          ASSET_NAME: ${{ steps.source.outputs.asset_name }}
+          RELEASE_ID: ${{ steps.draft.outputs.release_id }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          upload_url=$(gh api "repos/$REPOSITORY/releases/$RELEASE_ID" --jq '.upload_url')
+          upload_url=${upload_url%\{*}
+          upload_json=$(gh api --method POST "$upload_url?name=$ASSET_NAME" \
+            -H 'Content-Type: application/zip' --input "$ASSET_PATH")
+          jq -e --arg name "$ASSET_NAME" '.name == $name and .state == "uploaded"' <<< "$upload_json" >/dev/null
+          echo "asset_id=$(jq -r '.id' <<< "$upload_json")" >> "$GITHUB_OUTPUT"
+
+      - name: Publish the populated release
+        env:
+          RELEASE_ID: ${{ steps.draft.outputs.release_id }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          gh api --method PATCH "repos/$REPOSITORY/releases/$RELEASE_ID" -F draft=false > "$RUNNER_TEMP/published-release.json"
+          jq -e '.draft == false and .prerelease == false' "$RUNNER_TEMP/published-release.json" >/dev/null
+
+      - name: Verify immutable release, asset, tag, and source identity
+        env:
+          ASSET_PATH: ${{ steps.source.outputs.asset_path }}
+          ASSET_NAME: ${{ steps.source.outputs.asset_name }}
+          ASSET_SIZE: ${{ steps.source.outputs.artifact_size }}
+          ASSET_DIGEST: ${{ steps.source.outputs.artifact_digest }}
+          RELEASE_ID: ${{ steps.draft.outputs.release_id }}
+          TAG_OBJECT: ${{ steps.tag.outputs.tag_object }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          release_json=$(gh api "repos/$REPOSITORY/releases/$RELEASE_ID")
+          jq -e --arg tag "$RELEASE_TAG" --arg name "$ASSET_NAME" --arg digest "$ASSET_DIGEST" --argjson size "$ASSET_SIZE" '
+            .tag_name == $tag and .draft == false and .prerelease == false and .immutable == true and
+            (.assets|length) == 1 and .assets[0].name == $name and .assets[0].size == $size and .assets[0].digest == $digest
+          ' <<< "$release_json" >/dev/null
+          ref_json=$(gh api "repos/$REPOSITORY/git/ref/tags/$RELEASE_TAG")
+          jq -e --arg tag_object "$TAG_OBJECT" '.object.type == "tag" and .object.sha == $tag_object' <<< "$ref_json" >/dev/null
+          tag_object_json=$(gh api "repos/$REPOSITORY/git/tags/$TAG_OBJECT")
+          jq -e --arg source "$SOURCE_COMMIT_SHA" '.object.type == "commit" and .object.sha == $source' <<< "$tag_object_json" >/dev/null
+          jq -n \
+            --arg schema 'gooo/claim-evidence-lifecycle/release-receipt/v1' \
+            --arg tag "$RELEASE_TAG" --arg commit "$SOURCE_COMMIT_SHA" \
+            --arg tag_object "$TAG_OBJECT" --argjson release_id "$RELEASE_ID" \
+            --argjson run_id "$SOURCE_RUN_ID" --argjson artifact_id "$SOURCE_ARTIFACT_ID" \
+            --arg asset "$ASSET_NAME" --argjson size "$ASSET_SIZE" --arg digest "$ASSET_DIGEST" \
+            '{schema:$schema,tag:$tag,annotated:true,tag_object:$tag_object,peeled_commit:$commit,release_id:$release_id,source_run_id:$run_id,source_artifact_id:$artifact_id,asset:{name:$asset,size_bytes:$size,digest:$digest},immutable:true,authority:{github_token_only:true,partial_delete:0,partial_move:0,partial_recreate:0}}' \
+            > "$RUNNER_TEMP/release-receipt.json"
+
+      - name: Preserve release receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gooo-claim-evidence-lifecycle-release-receipt-${{ inputs.release_tag }}
+          path: ${{ runner.temp }}/release-receipt.json
+          if-no-files-found: ignore
+          retention-days: 30
