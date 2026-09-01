@@ -1,0 +1,85 @@
+module claim-evidence-lifecycle version=v0.1.0
+graph claim-evidence-lifecycle/v0.1.0
+
+ownership claim-state-machine
+ownership evidence-admissibility
+ownership subsumption-supersession
+ownership tombstone-retention
+ownership decision-precedence
+ownership artifact-schema
+
+activity claim-state-machine
+activity evidence-admissibility
+activity subsumption-supersession
+activity tombstone-retention
+activity decision-precedence
+activity artifact-schema
+activity canonical-case-catalog
+activity unknown-frontier
+activity causal-history
+activity replay-stability
+
+binding activity=claim-state-machine node=claim-state-machine
+binding activity=evidence-admissibility node=evidence-admissibility
+binding activity=subsumption-supersession node=subsumption-supersession
+binding activity=tombstone-retention node=tombstone-retention
+binding activity=decision-precedence node=decision-precedence
+binding activity=artifact-schema node=artifact-schema
+binding activity=canonical-case-catalog node=canonical-case-catalog
+binding activity=unknown-frontier node=unknown-frontier
+binding activity=causal-history node=causal-history
+binding activity=replay-stability node=replay-stability
+
+state ASSERTED
+state SUPPORTED
+state REFUTED
+state SUPERSEDED
+state UNKNOWN
+terminal state=SUPPORTED class=CLOSED
+terminal state=SUPERSEDED class=CLOSED
+terminal state=REFUTED class=REFUTED
+terminal state=UNKNOWN class=UNKNOWN
+precedence REFUTED UNKNOWN CLOSED
+unknown-fields stage step reason unknown_class next_operation blocked_by
+
+rule signal=counterexample outcome=REFUTED
+rule signal=digest-contradiction outcome=REFUTED
+rule signal=silent-claim-deletion outcome=REFUTED
+rule signal=evidence-without-provenance outcome=REFUTED
+rule signal=missing-evidence outcome=UNKNOWN
+rule signal=stale-evidence outcome=UNKNOWN
+rule signal=ambiguous-subject outcome=UNKNOWN
+rule signal=unbounded-scope outcome=UNKNOWN
+rule signal=explicit-supersession outcome=SUPERSEDED
+rule signal=supporting-evidence outcome=SUPPORTED
+rule signal=replay outcome=SUPPORTED
+rule signal=stable-tombstone outcome=SUPPORTED
+
+artifact name=claim-ledger.ndjson media=application/x-ndjson
+artifact name=evidence-ledger.ndjson media=application/x-ndjson
+artifact name=transition-events.ndjson media=application/x-ndjson
+artifact name=lifecycle-receipt.json media=application/json
+artifact name=replay-receipt.json media=application/json
+artifact name=report.md media=text/markdown
+
+metric compile wall_ms peak_rss_kib
+metric build wall_ms peak_rss_kib
+metric test wall_ms peak_rss_kib
+metric conformance wall_ms peak_rss_kib
+metric integration wall_ms peak_rss_kib
+external-utility evidence=0 state=UNKNOWN
+
+case id=supported-evidence class=CLOSED trigger=supporting-evidence signals=supporting-evidence evidence-present=true provenance=present freshness=fresh subject=claimant scope=bounded unknown_class=- next_operation=- blocked_by=- tombstone=true
+case id=explicit-supersession class=CLOSED trigger=explicit-supersession signals=explicit-supersession evidence-present=true provenance=present freshness=fresh subject=claimant scope=bounded unknown_class=- next_operation=- blocked_by=- tombstone=true
+case id=replay class=CLOSED trigger=replay signals=replay evidence-present=true provenance=present freshness=fresh subject=claimant scope=bounded unknown_class=- next_operation=- blocked_by=- tombstone=true
+case id=stable-tombstone class=CLOSED trigger=stable-tombstone signals=stable-tombstone evidence-present=true provenance=present freshness=fresh subject=claimant scope=bounded unknown_class=- next_operation=- blocked_by=- tombstone=true
+
+case id=missing-evidence class=UNKNOWN trigger=missing-evidence signals=missing-evidence evidence-present=false provenance=absent freshness=missing subject=claimant scope=bounded unknown_class=MISSING_EVIDENCE next_operation=collect-evidence blocked_by=evidence-ledger reason=required-evidence-is-absent tombstone=true
+case id=stale-evidence class=UNKNOWN trigger=stale-evidence signals=stale-evidence evidence-present=true provenance=present freshness=stale subject=claimant scope=bounded unknown_class=STALE_EVIDENCE next_operation=refresh-evidence blocked_by=freshness-window reason=evidence-is-outside-freshness-window tombstone=true
+case id=ambiguous-subject class=UNKNOWN trigger=ambiguous-subject signals=ambiguous-subject evidence-present=true provenance=present freshness=fresh subject=ambiguous scope=bounded unknown_class=AMBIGUOUS_SUBJECT next_operation=disambiguate-subject blocked_by=subject-identity reason=subject-maps-to-multiple-identities tombstone=true
+case id=unbounded-scope class=UNKNOWN trigger=unbounded-scope signals=unbounded-scope evidence-present=true provenance=present freshness=fresh subject=claimant scope=unbounded unknown_class=UNBOUNDED_SCOPE next_operation=bound-scope blocked_by=scope-boundary reason=scope-has-no-finite-boundary tombstone=true
+
+case id=counterexample class=REFUTED trigger=counterexample signals=counterexample,stale-evidence evidence-present=true provenance=present freshness=stale subject=claimant scope=bounded unknown_class=- next_operation=- blocked_by=- tombstone=true
+case id=digest-contradiction class=REFUTED trigger=digest-contradiction signals=digest-contradiction,ambiguous-subject evidence-present=true provenance=present freshness=fresh subject=ambiguous scope=bounded claim-digest=sha256:claim-digest observed-digest=sha256:other-digest unknown_class=- next_operation=- blocked_by=- tombstone=true
+case id=silent-claim-deletion class=REFUTED trigger=silent-claim-deletion signals=silent-claim-deletion evidence-present=true provenance=present freshness=fresh subject=claimant scope=bounded unknown_class=- next_operation=- blocked_by=- tombstone=true
+case id=evidence-without-provenance class=REFUTED trigger=evidence-without-provenance signals=evidence-without-provenance evidence-present=true provenance=missing freshness=fresh subject=claimant scope=bounded unknown_class=- next_operation=- blocked_by=- tombstone=true
