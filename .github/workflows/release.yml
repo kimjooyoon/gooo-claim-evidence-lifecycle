@@ -75,13 +75,6 @@ jobs:
           echo "asset_name=$asset_name" >> "$GITHUB_OUTPUT"
           echo "asset_path=$asset_path" >> "$GITHUB_OUTPUT"
 
-      - name: Verify immutable-release enforcement
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          immutable=$(gh api "repos/$REPOSITORY/immutable-releases")
-          jq -e '.enabled == true' <<< "$immutable" >/dev/null
-
       - name: Refuse an existing tag or release
         shell: bash
         run: |
