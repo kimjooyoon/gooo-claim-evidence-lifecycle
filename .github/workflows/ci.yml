@@ -4,7 +4,7 @@ on:
   pull_request:
     branches: [main]
   push:
-    branches: [main]
+    branches: [main, implementation]
   workflow_dispatch:
 
 permissions:
@@ -14,7 +14,7 @@ jobs:
   conformance:
     runs-on: ubuntu-latest
     env:
-      ARTIFACT_ROOT: ${{ runner.temp }}/gooo-claim-evidence-lifecycle
+      ARTIFACT_ROOT: /tmp/gooo-claim-evidence-lifecycle-${{ github.run_id }}
     steps:
       - name: Check out the reviewed tree
         uses: actions/checkout@v5
