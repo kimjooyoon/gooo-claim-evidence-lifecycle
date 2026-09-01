@@ -146,6 +146,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: gooo-claim-evidence-lifecycle-evidence-${{ github.sha }}
-          path: ${{ runner.temp }}/gooo-claim-evidence-lifecycle
+          path: /tmp/gooo-claim-evidence-lifecycle-${{ github.run_id }}
           if-no-files-found: warn
           retention-days: 30
