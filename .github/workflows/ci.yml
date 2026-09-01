@@ -1,0 +1,151 @@
+name: Claim evidence lifecycle CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main, implementation]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  conformance:
+    runs-on: ubuntu-latest
+    env:
+      ARTIFACT_ROOT: /tmp/gooo-claim-evidence-lifecycle-${{ github.run_id }}
+    steps:
+      - name: Check out the reviewed tree
+        uses: actions/checkout@v5
+
+      - name: Install Go 1.27
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.27.0'
+          cache: false
+
+      - name: Prepare evidence directories
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$ARTIFACT_ROOT/phases" "$ARTIFACT_ROOT/output"
+          git status --porcelain=v1 -z --untracked-files=all | sha256sum | awk '{print $1}' > "$ARTIFACT_ROOT/repository-before"
+
+      - name: Run authoritative measured phases
+        id: phases
+        shell: bash
+        run: |
+          set -uo pipefail
+          phase_dir="$ARTIFACT_ROOT/phases"
+          failed=0
+
+          if ! ./scripts/ci_phase.sh compile "$phase_dir" go test -run '^$' ./...; then failed=1; fi
+          if ! ./scripts/ci_phase.sh build "$phase_dir" go build -trimpath -o "$ARTIFACT_ROOT/lifecycle" ./cmd/lifecycle; then failed=1; fi
+          if ! ./scripts/ci_phase.sh test "$phase_dir" go test -json ./...; then failed=1; fi
+          if ! ./scripts/ci_phase.sh conformance "$phase_dir" "$ARTIFACT_ROOT/lifecycle" --root . --policy .gooo/claim-evidence-lifecycle.gooo --output "$ARTIFACT_ROOT/output" --mode conformance; then failed=1; fi
+          if ! ./scripts/ci_phase.sh integration "$phase_dir" "$ARTIFACT_ROOT/lifecycle" --root . --policy .gooo/claim-evidence-lifecycle.gooo --output "$RUNNER_TEMP/lifecycle-integration-output" --mode integration; then failed=1; fi
+
+          if test -f "$ARTIFACT_ROOT/output/lifecycle-receipt.json"; then
+            cat "$ARTIFACT_ROOT/output/report.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit "$failed"
+
+      - name: Assemble semantic and operational evidence
+        if: always()
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          phase_dir="$ARTIFACT_ROOT/phases"
+          test_files=0
+          test_passed=0
+          test_failed=0
+          test_skipped=0
+          if test -s "$phase_dir/test.log"; then
+            test_total=$(jq -s '[.[] | select(.Test != null and (.Action == "pass" or .Action == "fail" or .Action == "skip"))] | length' "$phase_dir/test.log" 2>/dev/null || true)
+            test_passed=$(jq -s '[.[] | select(.Test != null and .Action == "pass")] | length' "$phase_dir/test.log" 2>/dev/null || true)
+            test_failed=$(jq -s '[.[] | select(.Test != null and .Action == "fail")] | length' "$phase_dir/test.log" 2>/dev/null || true)
+            test_skipped=$(jq -s '[.[] | select(.Test != null and .Action == "skip")] | length' "$phase_dir/test.log" 2>/dev/null || true)
+            if [[ "$test_total" =~ ^[0-9]+$ ]]; then test_files=1; else test_total=null; fi
+            if ! [[ "$test_passed" =~ ^[0-9]+$ ]]; then test_passed=0; fi
+            if ! [[ "$test_failed" =~ ^[0-9]+$ ]]; then test_failed=0; fi
+            if ! [[ "$test_skipped" =~ ^[0-9]+$ ]]; then test_skipped=0; fi
+          else
+            test_total=null
+            test_passed=0
+            test_failed=0
+            test_skipped=0
+          fi
+
+          jq -s \
+            --arg go_version "$(go version 2>/dev/null || true)" \
+            --argjson test_total "$test_total" \
+            --argjson test_passed "$test_passed" \
+            --argjson test_failed "$test_failed" \
+            --argjson test_skipped "$test_skipped" \
+            ' {
+                schema:"gooo/claim-evidence-lifecycle/ci-metrics/v1",
+                go_version:$go_version,
+                phases: map({
+                  phase,
+                  conclusion,
+                  timing:{wall_ms,peak_rss_kib},
+                  metric_state:(if (.wall_ms == null or .peak_rss_kib == null) then "UNKNOWN" else "OBSERVED" end),
+                  unknown:(if (.wall_ms == null or .peak_rss_kib == null) then {
+                    stage:"ci-metrics",step:.phase,reason:"required metric is missing",unknown_class:"MISSING_METRIC",
+                    next_operation:"rerun-phase",blocked_by:"runner-metric-output"
+                  } else null end)
+                }),
+                tests:{
+                  total:$test_total,selected:$test_total,executed:($test_passed + $test_failed),reused:0,failed:$test_failed,unknown:0,
+                  skipped:$test_skipped,
+                  state:(if $test_total == null then "UNKNOWN" else "OBSERVED" end),
+                  missing:(if $test_total == null then {
+                    stage:"ci-tests",step:"test-summary",reason:"test event stream is missing",unknown_class:"MISSING_TEST_SUMMARY",
+                    next_operation:"rerun-test-phase",blocked_by:"test-log"
+                  } else null end)
+                }
+              }' \
+            "$phase_dir"/*.json > "$ARTIFACT_ROOT/ci-metrics.json"
+
+          phase_failures=$(jq -s '[.[] | select(.conclusion != "success")] | length' "$phase_dir"/*.json)
+          before=$(cat "$ARTIFACT_ROOT/repository-before")
+          after=$(git status --porcelain=v1 -z --untracked-files=all | sha256sum | awk '{print $1}')
+          jq -n \
+            --arg schema 'gooo/claim-evidence-lifecycle/operational-status/v1' \
+            --argjson phase_failures "$phase_failures" \
+            --arg before "$before" --arg after "$after" \
+            --arg semantic_state "$(if test -f "$ARTIFACT_ROOT/output/lifecycle-receipt.json"; then jq -r '.counts | "CLOSED=" + (.closed|tostring) + ",UNKNOWN=" + (.unknown|tostring) + ",REFUTED=" + (.refuted|tostring)' "$ARTIFACT_ROOT/output/lifecycle-receipt.json"; else echo UNKNOWN; fi)" \
+            '{schema:$schema,operational:{phase_failures:$phase_failures,input_repository_writes:0,local_authority_mutations:0,repository_unchanged:($before==$after)},semantic:{state:$semantic_state,claim_deletions:0,tombstone_count:(if ($semantic_state|startswith("CLOSED=")) then 12 else null end)}}' \
+            > "$ARTIFACT_ROOT/operational-status.json"
+
+          inventory_dirs=$(find . -type d \
+            ! -path './.git' ! -path './.git/*' ! -path './.cache' ! -path './.cache/*' \
+            ! -path './cache' ! -path './cache/*' ! -path './vendor' ! -path './vendor/*' \
+            ! -path './output' ! -path './output/*' | wc -l | tr -d ' ')
+          inventory_files=$(find . -type f \
+            ! -path './.git/*' ! -path './.cache/*' ! -path './cache/*' ! -path './vendor/*' ! -path './output/*' \
+            ! -path './README.md' | wc -l | tr -d ' ')
+          go_files=$(find . -type f -name '*.go' \
+            ! -path './.git/*' ! -path './.cache/*' ! -path './cache/*' ! -path './vendor/*' ! -path './output/*' | wc -l | tr -d ' ')
+          go_lines=$(find . -type f -name '*.go' \
+            ! -path './.git/*' ! -path './.cache/*' ! -path './cache/*' ! -path './vendor/*' ! -path './output/*' -print0 | xargs -0 awk 'END {print NR+0}')
+          gooo_files=$(find . -type f -name '*.gooo' \
+            ! -path './.git/*' ! -path './.cache/*' ! -path './cache/*' ! -path './vendor/*' ! -path './output/*' | wc -l | tr -d ' ')
+          gooo_lines=$(find . -type f -name '*.gooo' \
+            ! -path './.git/*' ! -path './.cache/*' ! -path './cache/*' ! -path './vendor/*' ! -path './output/*' -print0 | xargs -0 awk 'END {print NR+0}')
+          jq -n \
+            --argjson directories "$inventory_dirs" --argjson regular_files "$inventory_files" \
+            --argjson go_files "$go_files" --argjson go_lines "$go_lines" \
+            --argjson gooo_files "$gooo_files" --argjson gooo_lines "$gooo_lines" \
+            '{schema:"gooo/claim-evidence-lifecycle/inventory/v1",excluded:["root README",".git","cache","vendor","output"],directories:$directories,regular_files:$regular_files,go:{files:$go_files,physical_lines:$go_lines},gooo:{files:$gooo_files,physical_lines:$gooo_lines}}' \
+            > "$ARTIFACT_ROOT/inventory.json"
+
+      - name: Upload all CI evidence, including failed runs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gooo-claim-evidence-lifecycle-evidence-${{ github.sha }}
+          path: /tmp/gooo-claim-evidence-lifecycle-${{ github.run_id }}
+          if-no-files-found: warn
+          retention-days: 30
