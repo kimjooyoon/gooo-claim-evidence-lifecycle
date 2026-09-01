@@ -21,8 +21,10 @@ type UnknownFrontier struct {
 type ClaimRecord struct {
 	CaseID          string `json:"case_id"`
 	ClaimID         string `json:"claim_id"`
+	ClaimKind       string `json:"claim_kind"`
 	Status          string `json:"status"`
 	Tombstone       bool   `json:"tombstone"`
+	Deleted         bool   `json:"deleted"`
 	TombstoneReason string `json:"tombstone_reason"`
 	CausalEdgeID    string `json:"causal_edge_id"`
 }
@@ -131,8 +133,10 @@ func Evaluate(policy Policy) (Result, error) {
 		result.Claims = append(result.Claims, ClaimRecord{
 			CaseID:          value.ID,
 			ClaimID:         claimID,
+			ClaimKind:       "original",
 			Status:          state,
 			Tombstone:       true,
+			Deleted:         false,
 			TombstoneReason: "causal-history-retained",
 			CausalEdgeID:    edgeID,
 		})
@@ -140,8 +144,10 @@ func Evaluate(policy Policy) (Result, error) {
 			result.Claims = append(result.Claims, ClaimRecord{
 				CaseID:          value.ID,
 				ClaimID:         claimID + "-successor",
+				ClaimKind:       "successor",
 				Status:          "ASSERTED",
 				Tombstone:       false,
+				Deleted:         false,
 				TombstoneReason: "",
 				CausalEdgeID:    edgeID,
 			})
